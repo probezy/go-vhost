@@ -38,6 +38,8 @@ type (
 	// this is the function you apply to a net.Conn to get
 	// a new virtual-host multiplexed connection
 	muxFn func(net.Conn) (Conn, error)
+	// this is the function you get LazyLoading vhost by name
+	LazyLoadingFn func(name string) (muxer net.Listener, ok bool)
 
 	// an error encountered when multiplexing a connection
 	muxErr struct {
@@ -46,22 +48,28 @@ type (
 	}
 )
 
+var DefaultVhostLazyLoader LazyLoadingFn = func(name string) (muxer net.Listener, ok bool) {
+	return nil, false
+}
+
 type VhostMuxer struct {
-	listener     net.Listener         // listener on which we mux connections
-	muxTimeout   time.Duration        // a connection fails if it doesn't send enough data to mux after this timeout
-	vhostFn      muxFn                // new connections are multiplexed by applying this function
-	muxErrors    chan muxErr          // all muxing errors are sent over this channel
-	registry     map[string]*Listener // registry of name -> listener
-	sync.RWMutex                      // protects the registry
+	listener        net.Listener         // listener on which we mux connections
+	muxTimeout      time.Duration        // a connection fails if it doesn't send enough data to mux after this timeout
+	vhostFn         muxFn                // new connections are multiplexed by applying this function
+	muxErrors       chan muxErr          // all muxing errors are sent over this channel
+	registry        map[string]*Listener // registry of name -> listener
+	VhostLazyLoader LazyLoadingFn        // 惰性加载vhost
+	sync.RWMutex                         // protects the registry
 }
 
 func NewVhostMuxer(listener net.Listener, vhostFn muxFn, muxTimeout time.Duration) (*VhostMuxer, error) {
 	mux := &VhostMuxer{
-		listener:   listener,
-		muxTimeout: muxTimeout,
-		vhostFn:    vhostFn,
-		muxErrors:  make(chan muxErr),
-		registry:   make(map[string]*Listener),
+		listener:        listener,
+		muxTimeout:      muxTimeout,
+		vhostFn:         vhostFn,
+		muxErrors:       make(chan muxErr),
+		VhostLazyLoader: DefaultVhostLazyLoader,
+		registry:        make(map[string]*Listener),
 	}
 
 	go mux.run()
@@ -160,21 +168,49 @@ func (m *VhostMuxer) sendError(conn net.Conn, err error) {
 }
 
 func (m *VhostMuxer) get(name string) (l *Listener, ok bool) {
-	m.RLock()
-	defer m.RUnlock()
-	l, ok = m.registry[name]
+	l, ok = m.internalGet(name)
 	if !ok {
+
+		//尝试惰性加载
+		_, ok1 := m.VhostLazyLoader(name)
+		//这里的实现，应该是上层应用查看是否有该域名，如果存在，则创建一个注册，通过正常渠道，注册完对象后，再返回底层的lister，进一步处理。
+		//这里还要分析一下上层http https 和 tls的具体实现方式
+		if ok1 {
+			l, ok = m.internalGet(name)
+			if ok {
+				return
+			}
+		}
+
 		// look for a matching wildcard
 		parts := strings.Split(name, ".")
 		for i := 0; i < len(parts)-1; i++ {
 			parts[i] = "*"
 			name = strings.Join(parts[i:], ".")
-			l, ok = m.registry[name]
+			l, ok = m.internalGet(name)
 			if ok {
 				break
+			} else {
+				//尝试惰性加载
+				_, ok1 := m.VhostLazyLoader(name)
+				//这里的实现，应该是上层应用查看是否有该域名，如果存在，则创建一个注册，通过正常渠道，注册完对象后，再返回底层的lister，进一步处理。
+				//这里还要分析一下上层http https 和 tls的具体实现方式
+				if ok1 {
+					l, ok = m.internalGet(name)
+					if ok {
+						return
+					}
+					break
+				}
 			}
 		}
 	}
+	return
+}
+func (m *VhostMuxer) internalGet(name string) (l *Listener, ok bool) {
+	m.RLock()
+	defer m.RUnlock()
+	l, ok = m.registry[name]
 	return
 }
 
